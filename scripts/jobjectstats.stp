@@ -1,0 +1,216 @@
+global alloc_size_by_thread
+global alloc_count_by_thread
+global tid_name_map
+global nid_name_map
+global nid_tid_map
+global explicit_stopped
+global thread_alive
+global gc_active
+global gc_count
+global mempool_gc_active
+global mempool_gc_count
+
+probe begin
+{
+   log("Beginning analysis:");
+/* These threads do not trigger the hotspot.thread_start/stop probes or the
+ * hotspot.jni.<Attach|Detach>CurrentThread[AsDaemon] probes.  These names are
+ * arbitrary, but the main() method of a java program does execute in Main and
+ * Startup is the first thread that shows activity.
+ */
+   tid_name_map[0] = "Startup";
+   tid_name_map[1] = "Main";
+}
+
+probe hotspot.thread_start
+{
+   tid_name_map[id] = thread_name;
+   nid_tid_map[native_id] = id;
+   thread_alive[id] = 1;
+}
+
+probe hotspot.thread_stop
+{
+   thread_alive[id] = 0;
+   explicit_stopped[id] = 1;
+}
+
+probe hotspot.jni.AttachCurrentThreadAsDaemon
+{
+# This is only an attempt to attach thread, we do not yet know if successful.
+   tname = user_string(@cast(args, "JavaVMAttachArgs", "<jni.h>")->name);
+   nid = tid();
+   nid_name_map[nid] = tname;
+   nid_tid_map[nid] = -1;
+}
+
+probe hotspot.jni.AttachCurrentThreadAsDaemon.return
+{
+   tid = nid_tid_map[tid()];
+   if (tid > -1) {
+      if (ret == 0) {
+         thread_alive[tid] = 1;
+      } else {
+         thread_alive[tid] = 0;
+      }
+   }
+}
+
+probe hotspot.jni.AttachCurrentThread
+{
+# This is only an attempt to attach thread, we do not yet know if successful.
+   tname = user_string(@cast(args, "JavaVMAttachArgs", "<jni.h>")->name);
+   nid = tid();
+   nid_name_map[nid] = tname;
+   nid_tid_map[nid] = -1;
+}
+
+probe hotspot.jni.AttachCurrentThread.return
+{
+   tid = nid_tid_map[tid()];
+   if (tid > -1) {
+      if (ret == 0) {
+         thread_alive[tid] = 1;
+      } else {
+         thread_alive[tid] = 0;
+      }
+   }
+}
+
+probe hotspot.jni.DetachCurrentThread.return
+{
+   if (ret == 0) {
+# No longer a java thread.  If same native thread attaches again, it will be
+# a new java thread ID.
+      nid = tid();
+      tid = nid_tid_map[nid];
+      if (tid > -1) {
+         thread_alive[tid] = 0;
+         explicit_stopped[tid] = 1;
+      }
+      nid_tid_map[nid] = -1;
+   }
+}
+
+probe hotspot.gc_begin
+{
+   gc_active = 1;
+   gc_count++;
+}
+
+probe hotspot.gc_end
+{
+   gc_active = 0;
+}
+
+probe hotspot.mem_pool_gc_begin
+{
+   mempool_gc_active = 1;
+   mempool_gc_count++;
+}
+
+probe hotspot.mem_pool_gc_end
+{
+   mempool_gc_active = 0;
+}
+
+probe hotspot.object_alloc
+{
+   nid = tid();
+   if (tid_name_map[thread_id] == "") {
+/* A thread attached from JNI has a name, but at its inception the name is
+ * not associated with the Java thread ID.  It has however been mapped to the
+ * native ID.  At this point we can move the mapping over to the Java ID.
+ * This workaround relies on the logic that a native thread may only be
+ * attached as a single Java thread at a given time.  Throughout the lifetime
+ * of a program, it might attach and detach several times, but each will be
+ * considered a separate Java thread, and the first must detach before a new
+ * attach can occur.
+ */
+      tid_name_map[thread_id] = nid_name_map[nid];
+      delete nid_name_map[nid];
+   }
+   if (explicit_stopped[thread_id] != 1) {
+/* Several threads do not trigger the hotspot.thread_start probe.  They either
+ * begin execution as native threads (attaching through JNI functions) or
+ * are special threads started through other means.  This workaround assumes
+ * that such threads, unless they have already indicated their intent to stop,
+ * should be marked as active.
+ */
+      thread_alive[thread_id] = 1;
+      if (nid_tid_map[nid] == -1) {
+/* For those threads that do begin by using JNI attachment functions, we do
+ * not know the Java thread at the entry point (ie the
+ * hotspot.jni.AttachCurrentThread[AsDaemon] probes).  This captures a mapping
+ * so that other things can be set at the corresponding .return probes.
+ */
+         nid_tid_map[nid] = thread_id;
+      }
+   }
+   alloc_size_by_thread[thread_id] += size;
+   alloc_count_by_thread[thread_id]++;
+   nid_tid_map[tid()] = thread_id;
+}
+
+probe timer.s(1)
+{
+   summarize();
+}
+
+probe end
+{
+/* Several threads do not trigger the hotspot.thread_stop or 
+ * hotspot.jni.DetachCurrentThread probes.  Mark them as stopped manually.
+ */
+   foreach (tid in tid_name_map) {
+      thread_alive[tid] = 0;
+   }
+   summarize();
+}
+
+function summarize()
+{
+   output_lines = 0;
+   alloc_count = 0;
+   alloc_size = 0;
+   gc_act_string = " ";
+   mempool_gc_act_string = " ";
+   if (gc_active == 1) {
+      gc_act_string = "X"
+   }
+   if (mempool_gc_active == 1) {
+      mempool_gc_act_string = "X"
+   }
+   printf("                  ..__..   __. ,     ,    \n");
+   printf("                  ||  ||_ (__ -+- _.-+- __\n");
+   printf("               \\__||__|[_).__) | (_] | _) \n");
+   printf("*******************************************************************************\n");
+   printf("Garbage Collection:  Active[%s]  Run Count: %d\n", gc_act_string, gc_count);
+   printf("Mempool Garbage Collection:  Active[%s]  Run Count: %d\n", mempool_gc_act_string, mempool_gc_count);
+   printf("*******************************************************************************\n");
+   printf("\ TID |    Name                                          |   OC     | OS\n");
+   printf("-------------------------------------------------------------------------------\n");
+   output_lines += 9;
+   foreach (tid+ in alloc_count_by_thread) {
+      this_count = alloc_count_by_thread[tid];
+      this_size = alloc_size_by_thread[tid];
+      alloc_count += this_count;
+      alloc_size += this_size;
+      alive = "D";
+      if (thread_alive[tid]) {
+         alive = "A"
+      }
+      printf(" %-3d%1s| %-48s | %8d | %10d\n", tid, alive, tid_name_map[tid], this_count, this_size);
+      output_lines++;
+   }
+   printf("*******************************************************************************\n");
+   printf("An \"A\" after TID indicates thread is running, \"D\" indicates thread is dead.\n");
+   printf("%-s  %+s\n", "OC = Object Count.", "OS = Total size of objects allocated.");
+   printf("A total of %d objects occupying %d bytes have been allocated.\n", alloc_count, alloc_size);
+   printf("*******************************************************************************\n");
+   output_lines += 5;
+   while (output_lines <= 22) {
+      output_lines++;
+      printf("\n");
+   }
+}
